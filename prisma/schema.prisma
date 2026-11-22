@@ -1,0 +1,738 @@
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const cors = require('cors');
+const { Server } = require('socket.io');
+
+const authRoutes = require('./routes/auth');
+const userRoutes = require('./routes/users');
+const postRoutes = require('./routes/posts');
+const chatRoutes = require('./routes/chat');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: process.env.CLIENT_ORIGIN || '*', methods: ['GET', 'POST', 'PUT', 'DELETE'] }
+});
+
+app.set('io', io);
+app.use(cors({ origin: process.env.CLIENT_ORIGIN || '*' }));
+app.use(express.json({ limit: '15mb' }));
+
+// Health check
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', service: 'VibeGram API', timestamp: new Date().toISOString() });
+});
+
+app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/posts', postRoutes);
+app.use('/api/chat', chatRoutes);
+
+// Real-Time Socket.io Events
+const onlineUsers = new Map();
+
+io.on('connection', (socket) => {
+  socket.on('register_user', (userId) => {
+    if (userId) {
+      onlineUsers.set(userId, socket.id);
+      io.emit('online_users', Array.from(onlineUsers.keys()));
+    }
+  });
+
+  socket.on('join_conversation', (convId) => {
+    if (convId) socket.join(convId);
+  });
+
+  socket.on('typing', ({ convId, userId, isTyping }) => {
+    socket.to(convId).emit('user_typing', { convId, userId, isTyping });
+  });
+
+  socket.on('disconnect', () => {
+    for (const [uid, sid] of onlineUsers.entries()) {
+      if (sid === socket.id) {
+        onlineUsers.delete(uid);
+        break;
+      }
+    }
+    io.emit('online_users', Array.from(onlineUsers.keys()));
+  });
+});
+
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+  console.log(`🚀 VibeGram Full-Stack Server running on http://localhost:${PORT}`);
+});
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
+module.exports = prisma;
+const cloudinary = require('cloudinary').v2;
+const multer = require('multer');
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 50 * 1024 * 1024 } // 50MB max
+});
+
+function uploadBufferToCloudinary(buffer, folder = 'vibegram', resourceType = 'auto') {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder, resource_type: resourceType },
+      (err, result) => {
+        if (err) return reject(err);
+        resolve(result);
+      }
+    );
+    stream.end(buffer);
+  });
+}
+
+module.exports = { cloudinary, upload, uploadBufferToCloudinary };
+const jwt = require('jsonwebtoken');
+
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Unauthorized: No token provided' });
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = decoded.userId;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+  }
+}
+
+function optionalAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (token) {
+    try {
+      req.userId = jwt.verify(token, process.env.JWT_SECRET).userId;
+    } catch (_) {}
+  }
+  next();
+}
+
+module.exports = { authMiddleware, optionalAuth };
+const express = require('express');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const prisma = require('../utils/prisma');
+const { authMiddleware } = require('../middleware/auth');
+
+const router = express.Router();
+
+const signToken = (userId) => jwt.sign({ userId }, process.env.JWT_SECRET, { expiresIn: '30d' });
+
+function sanitizeUser(u) {
+  const { passwordHash, ...safe } = u;
+  return safe;
+}
+
+// Check username availability & generate suggestions
+router.get('/check-username/:username', async (req, res) => {
+  try {
+    const raw = String(req.params.username || '').toLowerCase().replace(/[^a-z0-9._]/g, '');
+    if (raw.length < 3) return res.json({ available: false, suggestions: [] });
+    const existing = await prisma.user.findUnique({ where: { username: raw } });
+    const base = raw.slice(0, 12) || 'vibe';
+    const candidates = [
+      `${base}_${Math.floor(10 + Math.random() * 89)}`,
+      `${base}.${Math.floor(100 + Math.random() * 899)}`,
+      `the.${base}${Math.floor(Math.random() * 9)}`,
+      `${base}_vibes`
+    ];
+    const taken = await prisma.user.findMany({ where: { username: { in: candidates } }, select: { username: true } });
+    const takenSet = new Set(taken.map(t => t.username));
+    const suggestions = candidates.filter(c => !takenSet.has(c)).slice(0, 3);
+    res.json({ available: !existing, suggestions });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Sign Up
+router.post('/signup', async (req, res) => {
+  try {
+    const { username, password, fullName, contact, dob, avatarUrl } = req.body;
+    const cleanUsername = String(username || '').toLowerCase().replace(/[^a-z0-9._]/g, '');
+    if (cleanUsername.length < 3) return res.status(400).json({ error: 'Username must be at least 3 characters' });
+    if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+
+    const exists = await prisma.user.findUnique({ where: { username: cleanUsername } });
+    if (exists) return res.status(409).json({ error: 'Username is already taken' });
+
+    const cleanContact = String(contact || '').trim();
+    const isEmail = cleanContact.includes('@');
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const user = await prisma.user.create({
+      data: {
+        username: cleanUsername,
+        fullName: (fullName || cleanUsername).trim(),
+        email: isEmail ? cleanContact.toLowerCase() : null,
+        phone: !isEmail && cleanContact ? cleanContact : null,
+        passwordHash,
+        dob: dob || null,
+        avatarUrl: avatarUrl || ''
+      }
+    });
+
+    const token = signToken(user.id);
+    res.status(201).json({ token, user: sanitizeUser(user) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Login (by username, email, or phone)
+router.post('/login', async (req, res) => {
+  try {
+    const { identifier, password } = req.body;
+    const idf = String(identifier || '').trim();
+    if (!idf || !password) return res.status(400).json({ error: 'Missing credentials' });
+
+    const user = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { username: idf.toLowerCase() },
+          { email: idf.toLowerCase() },
+          { phone: idf }
+        ]
+      }
+    });
+
+    if (!user) return res.status(401).json({ error: 'Invalid username or password' });
+    const valid = await bcrypt.compare(password, user.passwordHash);
+    if (!valid) return res.status(401).json({ error: 'Invalid username or password' });
+
+    const token = signToken(user.id);
+    res.json({ token, user: sanitizeUser(user) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Reset Password
+router.post('/reset-password', async (req, res) => {
+  try {
+    const { identifier, otp, newPassword } = req.body;
+    if (String(otp) !== '123456') return res.status(400).json({ error: 'Invalid OTP code' });
+    if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: 'Password too short' });
+
+    const idf = String(identifier || '').trim();
+    const user = await prisma.user.findFirst({
+      where: { OR: [{ username: idf.toLowerCase() }, { email: idf.toLowerCase() }, { phone: idf }] }
+    });
+    if (!user) return res.status(404).json({ error: 'Account not found' });
+
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get Current User
+router.get('/me', authMiddleware, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.userId } });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ user: sanitizeUser(user) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
+const express = require('express');
+const prisma = require('../utils/prisma');
+const { authMiddleware, optionalAuth } = require('../middleware/auth');
+const { upload, uploadBufferToCloudinary } = require('../utils/cloudinary');
+
+const router = express.Router();
+
+// Search users
+router.get('/search', optionalAuth, async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim().toLowerCase();
+    const users = await prisma.user.findMany({
+      where: q ? {
+        OR: [
+          { username: { contains: q, mode: 'insensitive' } },
+          { fullName: { contains: q, mode: 'insensitive' } }
+        ]
+      } : {},
+      take: 25,
+      select: { id: true, username: true, fullName: true, avatarUrl: true, isVerified: true }
+    });
+    res.json({ users });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get profile by username
+router.get('/:username', optionalAuth, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { username: req.params.username.toLowerCase() },
+      include: {
+        _count: { select: { posts: true, followers: true, following: true } },
+        posts: { orderBy: [{ isPinned: 'desc' }, { createdAt: 'desc' }] }
+      }
+    });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    let followStatus = 'NONE';
+    if (req.userId && req.userId !== user.id) {
+      const f = await prisma.follow.findUnique({
+        where: { followerId_followingId: { followerId: req.userId, followingId: user.id } }
+      });
+      if (f) followStatus = f.status;
+    }
+
+    const { passwordHash, ...safe } = user;
+    res.json({ user: safe, followStatus });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update profile
+router.put('/profile', authMiddleware, async (req, res) => {
+  try {
+    const { fullName, username, pronouns, bio, website, gender, isPrivate, isProfessional, proCategory, avatarUrl } = req.body;
+    const data = {};
+    if (fullName !== undefined) data.fullName = fullName;
+    if (username !== undefined) data.username = username.toLowerCase().replace(/[^a-z0-9._]/g, '');
+    if (pronouns !== undefined) data.pronouns = pronouns;
+    if (bio !== undefined) data.bio = bio;
+    if (website !== undefined) data.website = website;
+    if (gender !== undefined) data.gender = gender;
+    if (isPrivate !== undefined) data.isPrivate = Boolean(isPrivate);
+    if (isProfessional !== undefined) data.isProfessional = Boolean(isProfessional);
+    if (proCategory !== undefined) data.proCategory = proCategory;
+    if (avatarUrl !== undefined) data.avatarUrl = avatarUrl;
+
+    const updated = await prisma.user.update({ where: { id: req.userId }, data });
+    const { passwordHash, ...safe } = updated;
+    res.json({ user: safe });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Upload Avatar to Cloudinary
+router.post('/avatar', authMiddleware, upload.single('avatar'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image file uploaded' });
+    const uploaded = await uploadBufferToCloudinary(req.file.buffer, 'vibegram/avatars', 'image');
+    const updated = await prisma.user.update({
+      where: { id: req.userId },
+      data: { avatarUrl: uploaded.secure_url }
+    });
+    res.json({ avatarUrl: updated.avatarUrl });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Follow / Unfollow
+router.post('/:userId/follow', authMiddleware, async (req, res) => {
+  try {
+    const targetId = req.params.userId;
+    if (targetId === req.userId) return res.status(400).json({ error: 'Cannot follow yourself' });
+
+    const existing = await prisma.follow.findUnique({
+      where: { followerId_followingId: { followerId: req.userId, followingId: targetId } }
+    });
+
+    if (existing) {
+      await prisma.follow.delete({ where: { id: existing.id } });
+      return res.json({ status: 'NONE' });
+    }
+
+    const target = await prisma.user.findUnique({ where: { id: targetId } });
+    if (!target) return res.status(404).json({ error: 'User not found' });
+
+    const status = target.isPrivate ? 'PENDING' : 'ACCEPTED';
+    await prisma.follow.create({ data: { followerId: req.userId, followingId: targetId, status } });
+
+    await prisma.notification.create({
+      data: {
+        recipientId: targetId,
+        actorId: req.userId,
+        type: 'FOLLOW',
+        text: status === 'PENDING' ? 'requested to follow you.' : 'started following you.'
+      }
+    });
+
+    res.json({ status });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
+const express = require('express');
+const prisma = require('../utils/prisma');
+const { authMiddleware, optionalAuth } = require('../middleware/auth');
+const { upload, uploadBufferToCloudinary } = require('../utils/cloudinary');
+
+const router = express.Router();
+
+// Get Home Feed & Reels
+router.get('/', optionalAuth, async (req, res) => {
+  try {
+    const type = req.query.type; // optional: REEL
+    const posts = await prisma.post.findMany({
+      where: type ? { mediaType: type } : {},
+      orderBy: { createdAt: 'desc' },
+      take: 40,
+      include: {
+        user: { select: { id: true, username: true, fullName: true, avatarUrl: true, isVerified: true } },
+        _count: { select: { likes: true, comments: true } },
+        likes: req.userId ? { where: { userId: req.userId }, select: { id: true } } : false,
+        savedBy: req.userId ? { where: { userId: req.userId }, select: { id: true } } : false
+      }
+    });
+
+    const formatted = posts.map(p => ({
+      ...p,
+      likesCount: p._count.likes,
+      commentsCount: p._count.comments,
+      liked: Array.isArray(p.likes) && p.likes.length > 0,
+      saved: Array.isArray(p.savedBy) && p.savedBy.length > 0
+    }));
+
+    res.json({ posts: formatted });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Create Post or Reel (with Cloudinary file upload)
+router.post('/', authMiddleware, upload.array('media', 10), async (req, res) => {
+  try {
+    const { caption, location, mediaType, filter, audioName, ratio } = req.body;
+    const urls = [];
+
+    if (req.files && req.files.length > 0) {
+      for (const file of req.files) {
+        const resType = file.mimetype.startsWith('video') ? 'video' : 'image';
+        const uploaded = await uploadBufferToCloudinary(file.buffer, 'vibegram/posts', resType);
+        urls.push(uploaded.secure_url);
+      }
+    }
+
+    const post = await prisma.post.create({
+      data: {
+        userId: req.userId,
+        caption: caption || '',
+        location: location || '',
+        mediaUrls: urls,
+        mediaType: mediaType || (urls.length > 1 ? 'CAROUSEL' : 'IMAGE'),
+        filter: filter || '',
+        audioName: audioName || '',
+        ratio: ratio || '4/5'
+      },
+      include: {
+        user: { select: { id: true, username: true, fullName: true, avatarUrl: true, isVerified: true } }
+      }
+    });
+
+    res.status(201).json({ post });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Toggle Like
+router.post('/:postId/like', authMiddleware, async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const existing = await prisma.like.findUnique({
+      where: { userId_postId: { userId: req.userId, postId } }
+    });
+
+    if (existing) {
+      await prisma.like.delete({ where: { id: existing.id } });
+      return res.json({ liked: false });
+    }
+
+    await prisma.like.create({ data: { userId: req.userId, postId } });
+    const post = await prisma.post.findUnique({ where: { id: postId } });
+    if (post && post.userId !== req.userId) {
+      await prisma.notification.create({
+        data: {
+          recipientId: post.userId,
+          actorId: req.userId,
+          type: 'LIKE',
+          postId,
+          text: post.mediaType === 'REEL' ? 'liked your reel.' : 'liked your photo.'
+        }
+      });
+    }
+    res.json({ liked: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Toggle Save
+router.post('/:postId/save', authMiddleware, async (req, res) => {
+  try {
+    const { postId } = req.params;
+    const collection = req.body.collection || 'All Posts';
+    const existing = await prisma.savedPost.findUnique({
+      where: { userId_postId: { userId: req.userId, postId } }
+    });
+
+    if (existing) {
+      await prisma.savedPost.delete({ where: { id: existing.id } });
+      return res.json({ saved: false });
+    }
+
+    await prisma.savedPost.create({ data: { userId: req.userId, postId, collection } });
+    res.json({ saved: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get & Add Comments
+router.get('/:postId/comments', async (req, res) => {
+  try {
+    const comments = await prisma.comment.findMany({
+      where: { postId: req.params.postId, parentId: null },
+      orderBy: [{ isPinned: 'desc' }, { createdAt: 'desc' }],
+      include: {
+        user: { select: { id: true, username: true, avatarUrl: true, isVerified: true } },
+        replies: {
+          orderBy: { createdAt: 'asc' },
+          include: { user: { select: { id: true, username: true, avatarUrl: true, isVerified: true } } }
+        }
+      }
+    });
+    res.json({ comments });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/:postId/comments', authMiddleware, async (req, res) => {
+  try {
+    const { text, parentId } = req.body;
+    if (!text || !text.trim()) return res.status(400).json({ error: 'Comment cannot be empty' });
+
+    const comment = await prisma.comment.create({
+      data: {
+        userId: req.userId,
+        postId: req.params.postId,
+        parentId: parentId || null,
+        text: text.trim()
+      },
+      include: { user: { select: { id: true, username: true, avatarUrl: true, isVerified: true } } }
+    });
+
+    const post = await prisma.post.findUnique({ where: { id: req.params.postId } });
+    if (post && post.userId !== req.userId) {
+      await prisma.notification.create({
+        data: {
+          recipientId: post.userId,
+          actorId: req.userId,
+          type: parentId ? 'REPLY' : 'COMMENT',
+          postId: post.id,
+          commentId: comment.id,
+          text: `commented: ${text.trim().slice(0, 60)}`
+        }
+      });
+    }
+
+    res.status(201).json({ comment });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Active Stories (24h window)
+router.get('/stories/active', optionalAuth, async (req, res) => {
+  try {
+    const stories = await prisma.story.findMany({
+      where: { expiresAt: { gt: new Date() } },
+      orderBy: { createdAt: 'asc' },
+      include: { user: { select: { id: true, username: true, avatarUrl: true } } }
+    });
+    res.json({ stories });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/stories', authMiddleware, upload.single('media'), async (req, res) => {
+  try {
+    let mediaUrl = req.body.mediaUrl || '';
+    let mediaType = 'IMAGE';
+    if (req.file) {
+      mediaType = req.file.mimetype.startsWith('video') ? 'VIDEO' : 'IMAGE';
+      const up = await uploadBufferToCloudinary(req.file.buffer, 'vibegram/stories', mediaType.toLowerCase());
+      mediaUrl = up.secure_url;
+    }
+    const story = await prisma.story.create({
+      data: {
+        userId: req.userId,
+        mediaUrl,
+        mediaType,
+        stickersJson: req.body.stickersJson || '[]',
+        isCloseFriends: req.body.isCloseFriends === 'true',
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
+      }
+    });
+    res.status(201).json({ story });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 24h Music Notes
+router.get('/notes/active', async (req, res) => {
+  try {
+    const notes = await prisma.note.findMany({
+      where: { expiresAt: { gt: new Date() } },
+      include: { user: { select: { id: true, username: true, avatarUrl: true } } }
+    });
+    res.json({ notes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/notes', authMiddleware, async (req, res) => {
+  try {
+    const { text, musicTitle, musicArtist, location } = req.body;
+    const note = await prisma.note.upsert({
+      where: { userId: req.userId },
+      update: { text, musicTitle: musicTitle || '', musicArtist: musicArtist || '', location: location || '', expiresAt: new Date(Date.now() + 24 * 3600 * 1000) },
+      create: { userId: req.userId, text, musicTitle: musicTitle || '', musicArtist: musicArtist || '', location: location || '', expiresAt: new Date(Date.now() + 24 * 3600 * 1000) }
+    });
+    res.json({ note });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
+const express = require('express');
+const prisma = require('../utils/prisma');
+const { authMiddleware } = require('../middleware/auth');
+const { upload, uploadBufferToCloudinary } = require('../utils/cloudinary');
+
+const router = express.Router();
+
+// List Conversations
+router.get('/conversations', authMiddleware, async (req, res) => {
+  try {
+    const convs = await prisma.conversation.findMany({
+      where: { OR: [{ userAId: req.userId }, { userBId: req.userId }] },
+      orderBy: { updatedAt: 'desc' },
+      include: {
+        userA: { select: { id: true, username: true, fullName: true, avatarUrl: true } },
+        userB: { select: { id: true, username: true, fullName: true, avatarUrl: true } },
+        messages: { orderBy: { createdAt: 'desc' }, take: 1 }
+      }
+    });
+    res.json({ conversations: convs });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get or Create Conversation with target user
+router.post('/conversations/:targetUserId', authMiddleware, async (req, res) => {
+  try {
+    const [u1, u2] = [req.userId, req.params.targetUserId].sort();
+    let conv = await prisma.conversation.findUnique({
+      where: { userAId_userBId: { userAId: u1, userBId: u2 } },
+      include: { messages: { orderBy: { createdAt: 'asc' } } }
+    });
+    if (!conv) {
+      conv = await prisma.conversation.create({
+        data: { userAId: u1, userBId: u2 },
+        include: { messages: true }
+      });
+    }
+    res.json({ conversation: conv });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send Message (Text / Media / Voice Note)
+router.post('/conversations/:conversationId/messages', authMiddleware, upload.single('media'), async (req, res) => {
+  try {
+    let mediaUrl = req.body.mediaUrl || '';
+    let mediaType = req.body.mediaType || '';
+
+    if (req.file) {
+      const isAudio = req.file.mimetype.startsWith('audio');
+      const isVideo = req.file.mimetype.startsWith('video');
+      const resType = isAudio || isVideo ? 'video' : 'image';
+      const up = await uploadBufferToCloudinary(req.file.buffer, 'vibegram/chat', resType);
+      mediaUrl = up.secure_url;
+      mediaType = isAudio ? 'VOICE' : isVideo ? 'VIDEO' : 'IMAGE';
+    }
+
+    const msg = await prisma.message.create({
+      data: {
+        conversationId: req.params.conversationId,
+        senderId: req.userId,
+        text: req.body.text || '',
+        mediaUrl,
+        mediaType,
+        voiceDuration: Number(req.body.voiceDuration || 0),
+        replyToText: req.body.replyToText || '',
+        isVanish: req.body.isVanish === 'true'
+      }
+    });
+
+    await prisma.conversation.update({
+      where: { id: req.params.conversationId },
+      data: { updatedAt: new Date() }
+    });
+
+    // Broadcast via Socket.io if active
+    const io = req.app.get('io');
+    if (io) io.to(req.params.conversationId).emit('new_message', msg);
+
+    res.status(201).json({ message: msg });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get Notifications
+router.get('/notifications', authMiddleware, async (req, res) => {
+  try {
+    const notifications = await prisma.notification.findMany({
+      where: { recipientId: req.userId },
+      orderBy: { createdAt: 'desc' },
+      take: 40,
+      include: { actor: { select: { id: true, username: true, avatarUrl: true } } }
+    });
+    res.json({ notifications });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
